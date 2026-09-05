@@ -1,0 +1,154 @@
+name: Build HCC Client (Windows)
+
+# اجرای دستی از تب Actions در گیت‌هاب
+on:
+  workflow_dispatch:
+
+env:
+  # نسخهٔ سورس RustDesk که پچ HCC دقیقاً روی آن تست شده (پین‌شده برای تکرارپذیری)
+  RUSTDESK_REF: "9a1c8da14382e0a5205eabd397fbaf21be320566"
+  # baseline رسمی vcpkg مطابق خود RustDesk
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  # کش باینری vcpkg روی GitHub Actions (اجرای دوم را بسیار سریع می‌کند)
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  # ---- تنظیمات سرور HCC که داخل باینری hardcode می‌شوند ----
+  HCC_SERVER: "remote.hcc.net"
+  HCC_KEY: "hjvvrw+i3YlJ8ZRebmGYBFbA+kDhWS9jeV2XTMX3c+E="
+  HCC_API: "http://remote.hcc.net"
+  SCITER_DLL_URL: "https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.win/x64/sciter.dll"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Export GitHub Actions cache env (for vcpkg binary cache)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout RustDesk source (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: rustdesk/rustdesk
+          ref: ${{ env.RUSTDESK_REF }}
+          submodules: recursive
+
+      - name: Apply HCC server + branding patch
+        shell: bash
+        run: |
+          set -e
+          CFG=libs/hbb_common/src/config.rs
+          COMMON=src/common.rs
+          # 1) سرور ID/Rendezvous
+          sed -i "s#rs-ny.rustdesk.com#${HCC_SERVER}#g" "$CFG"
+          # 2) کلید عمومی
+          sed -i "s#OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=#${HCC_KEY}#g" "$CFG"
+          # 3) نام نمایشی برنامه (فقط روی خط APP_NAME)
+          sed -i '/APP_NAME/s#"RustDesk"#"HCC"#' "$CFG"
+          # 4) آدرس API server (فقط خط fallback با .to_owned() — نه تست‌ها)
+          sed -i 's#"https://admin.rustdesk.com".to_owned()#"'"${HCC_API}"'".to_owned()#' "$COMMON"
+
+          echo "---------- verify patch ----------"
+          grep -n "${HCC_SERVER}" "$CFG" || true
+          grep -n "${HCC_KEY}" "$CFG" || true
+          grep -n 'RwLock::new("HCC"' "$CFG" || true
+          grep -n "remote.hcc.net" "$COMMON" || true
+          # اگر هر پچ اعمال نشده باشد، build را متوقف کن
+          grep -q "\"${HCC_SERVER}\"" "$CFG"
+          grep -q "${HCC_KEY}" "$CFG"
+          grep -q 'RwLock::new("HCC"' "$CFG"
+          grep -q "${HCC_API}" "$COMMON"
+          echo "patch OK"
+
+      - name: Slim vcpkg.json (drop ffmpeg + mfx, software codecs only)
+        shell: bash
+        run: |
+          cat > vcpkg.json <<'JSON'
+          {
+            "dependencies": [
+              { "name": "aom", "host": true },
+              { "name": "aom", "host": false },
+              { "name": "libjpeg-turbo", "host": true },
+              { "name": "libjpeg-turbo", "host": false },
+              { "name": "libsodium", "host": false, "platform": "windows & arm64" },
+              { "name": "opus", "host": true },
+              { "name": "opus", "host": false },
+              { "name": "libvpx", "host": true },
+              { "name": "libvpx", "host": false },
+              { "name": "libyuv", "host": true },
+              { "name": "libyuv", "host": false }
+            ],
+            "vcpkg-configuration": {
+              "default-registry": {
+                "kind": "builtin",
+                "baseline": "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+              },
+              "overlay-ports": [ "./res/vcpkg" ],
+              "overlay-triplets": [ "./res/vcpkg-triplets" ]
+            }
+          }
+          JSON
+          echo "----- new vcpkg.json -----"
+          cat vcpkg.json
+
+      - name: Setup vcpkg (pinned commit + GHA binary cache)
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+
+      - name: Install native dependencies (vcpkg manifest)
+        shell: bash
+        run: |
+          "$VCPKG_ROOT/vcpkg" install --x-install-root="$VCPKG_ROOT/installed"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Configure libclang (for bindgen)
+        shell: bash
+        run: echo "LIBCLANG_PATH=C:\\Program Files\\LLVM\\bin" >> "$GITHUB_ENV"
+
+      - name: Inline Sciter UI resources
+        shell: bash
+        run: python res/inline-sciter.py
+
+      - name: Build HCC client (Sciter, release)
+        shell: bash
+        run: cargo build --locked --release --features inline
+
+      - name: Download sciter.dll (runtime dependency)
+        shell: bash
+        run: |
+          curl -fL -o target/release/sciter.dll "$SCITER_DLL_URL"
+          ls -la target/release/sciter.dll
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/rustdesk.exe dist/HCC.exe
+          cp target/release/sciter.dll  dist/sciter.dll
+          cat > dist/README-HCC.txt <<'TXT'
+          HCC Remote Desktop (RustDesk-based, self-hosted)
+          ================================================
+          Server (baked in): remote.hcc.net
+          API server:        http://remote.hcc.net
+
+          How to run:
+            - Keep HCC.exe and sciter.dll in the SAME folder.
+            - Run HCC.exe. It connects to remote.hcc.net automatically.
+
+          No configuration needed on the client side.
+          TXT
+          ls -la dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HCC-Windows-x64
+          path: dist/**
+          if-no-files-found: error
