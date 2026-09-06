@@ -98,10 +98,13 @@ jobs:
         with:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
 
-      - name: Install native dependencies (vcpkg manifest)
+      - name: Install native dependencies (vcpkg manifest, static triplet)
         shell: bash
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows-static
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
         run: |
-          "$VCPKG_ROOT/vcpkg" install --x-install-root="$VCPKG_ROOT/installed"
+          "$VCPKG_ROOT/vcpkg" install --triplet x64-windows-static --x-install-root="$VCPKG_ROOT/installed"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
